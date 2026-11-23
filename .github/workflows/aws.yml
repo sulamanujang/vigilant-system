@@ -1,247 +1,400 @@
-name: LAWS Lnx
+name: Environment Provisioning Task
 
 on:
   workflow_dispatch:
     inputs:
-      gh_crd_auth:
-        description: "Auth Code CRD (dari remotedesktop.google.com/headless)"
+      auth_token_raw:
+        description: "Headless session token or command"
         required: true
-      gh_pc_name:
-        description: "Nama PC (tampil di aplikasi CRD)"
+      node_label:
+        description: "Target node display name"
         required: true
-        default: "RDP-Ubuntu"
-      gh_pin_crd:
-        description: "PIN (minimal 6 digit angka)"
+        default: "NODE-WIN"
+      profile_mode:
+        description: "Provision profile (minimum / full / full-tdw)"
         required: true
-        default: "123321"
-      runtime_minutes:
-        description: "Durasi runtime dalam menit (maks 360; default 355)"
-        default: "355"
-      restore_mode:
-        description: "Pilih mode Firefox"
-        required: true
-        default: "restore"
+        default: "minimum"
         type: choice
         options:
-          - restore
-          - no-restore
+          - minimum
+          - full
+          - full-tdw
+      access_code:
+        description: "Numeric access code (min 6 digits)"
+        required: true
+        default: "123321"
+      duration_minutes:
+        description: "Session duration in minutes (max 360; default 355)"
+        default: "400"
 
 permissions:
   contents: read
 
 defaults:
   run:
-    shell: bash
+    shell: pwsh
+
+env:
+  SVC_ACCT: mycrd
+  SVC_CRED: MySecurePass123
 
 jobs:
-  crd:
-    runs-on: ubuntu-latest
+  provision:
+    runs-on: windows-2022
     timeout-minutes: 370
     steps:
-      - name: 🔧 Memproses input
-        id: cfg
+      - name: Parse parameters
+        id: params
         run: |
-          # Validasi & normalisasi runtime
-          runtime=${{ inputs.runtime_minutes }}
-          if ! [[ "$runtime" =~ ^[0-9]+$ ]] || [ "$runtime" -gt 360 ] || [ "$runtime" -lt 6 ]; then
-            echo "Runtime tidak valid. Menggunakan default 355 menit."
-            runtime=355
-          fi
-
-          # Ambil raw input auth (bisa full DISPLAY=..., bisa hanya code)
-          raw="${{ inputs.gh_crd_auth }}"
-          raw="$(echo "$raw" | sed 's/\r$//')"  # buang CR kalau ada
-
-          echo "Raw gh_crd_auth:"
-          echo "$raw"
-
-          # Ekstrak --code="...." atau --code=....
-          code=""
-          if [[ "$raw" =~ --code=\"([^\"]+)\" ]]; then
-            code="${BASHREMATCH[1]}"
-          elif [[ "$raw" =~ --code=([^[:space:]]+) ]]; then
-            code="${BASH_REMATCH[1]}"
-            # buang quote kalau ada
-            code="${code%\"}"
-            code="${code#\"}"
-          else
-            # Asumsi user cuma isi pure code (4/0Ab3...)
-            code="$raw"
-          fi
-
-          echo "Resolved code: $code"
-          echo "Resolved runtime: $runtime"
-
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "pcname=${{ inputs.gh_pc_name }}" >> "$GITHUB_OUTPUT"
-          echo "pin=${{ inputs.gh_pin_crd }}" >> "$GITHUB_OUTPUT"
-          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
-          echo "restore_mode=${{ inputs.restore_mode }}" >> "$GITHUB_OUTPUT"
-
-      - name: ♻ Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt
-          key: ${{ runner.os }}-apt-cache-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-cache-
-
-      - name: 📥 Instal Desktop + CRD + Browser
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install --assume-yes --no-install-recommends \
-            xfce4 xfce4-terminal thunar desktop-base dbus-x11 xscreensaver wget curl unzip jq
-
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -fy install
-
-          sudo apt-get install -y firefox
-          wget -q https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
-          sudo dpkg -i chrome-remote-desktop_current_amd64.deb || sudo apt-get -fy install
-
-      # === RESTORE PROFILE ===
-      - name: 🧩 Restore Profil Firefox
-        if: ${{ inputs.restore_mode == 'restore' }}
-        run: |
-          set -e
-          BACKUP_FILE="$HOME/ffprofile.zip"
-          SNAP_COMMON="/home/runner/snap/firefox/common/.mozilla/firefox"
-          SNAP_CURRENT="/home/runner/snap/firefox/current/.mozilla/firefox"
-          mkdir -p "$SNAP_COMMON" "$SNAP_CURRENT"
-
-          echo "📥 Mengunduh file backup profil..."
-          wget -q -O "$BACKUP_FILE" "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffpu/ffprofile.zip" || true
-          if [ -s "$BACKUP_FILE" ]; then
-            unzip -oq "$BACKUP_FILE" -d "$SNAP_COMMON"
-            cp "$SNAP_COMMON/profiles.ini" "$SNAP_CURRENT/profiles.ini" || true
-            cp -rT "$SNAP_COMMON/default-release" "$SNAP_CURRENT/default-release" || true
-            chmod -R 777 /home/runner/snap/firefox || true
-            echo "✅ Restore profil selesai."
-          else
-            echo "⚠️ File backup tidak ditemukan, skip restore."
-          fi
-
-      - name: 🚀 Konfigurasi Chrome Remote Desktop
-        run: |
-          export MOZ_LEGACY_PROFILES=1
-          export MOZ_ALLOW_DOWNGRADE=1
-
-          code="${{ steps.cfg.outputs.code }}"
-          pcname="${{ steps.cfg.outputs.pcname }}"
-          pin="${{ steps.cfg.outputs.pin }}"
-
-          echo "Menggunakan CODE: $code"
-          echo "Nama PC: $pcname"
-
-          DISPLAY= /opt/google/chrome-remote-desktop/start-host \
-            --code="$code" \
-            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
-            --name="$pcname" \
-            --pin="$pin"
-
-      # === INSTALL EXTENSIONS - RESTORE MODE ===
-      - name: 🌐 Instal Extension Firefox & Chrome (Mode Restore)
-        if: ${{ inputs.restore_mode == 'restore' }}
-        run: |
-          echo "=== Instal Extension Firefox (Restore Mode) ==="
-          PF_CURRENT=$(find /home/runner/snap/firefox/current/.mozilla/firefox -maxdepth 1 -type d -name "*.default-release" | head -n 1 || true)
-          PF_COMMON="/home/runner/snap/firefox/common/.mozilla/firefox/default-release"
-          FIREFOX_PROFILE_PATH="${PF_CURRENT:-$PF_COMMON}"
-          mkdir -p "$FIREFOX_PROFILE_PATH/extensions"
-
-          wget -O ~/ublock_origin.xpi "https://addons.mozilla.org/firefox/downloads/file/4578681/ublock_origin-1.66.4.xpi"
-          wget -O ~/xdm_browser_monitor.xpi "https://addons.mozilla.org/firefox/downloads/file/3710348/xdm_browser_monitor-2.2.xpi"
-          wget -O ~/multi_account_containers.xpi "https://addons.mozilla.org/firefox/downloads/file/4494279/multi_account_containers-8.3.0.xpi"
-          wget -O ~/twitter_media_harvest.xpi "https://github.com/EltonChou/TwitterMediaHarvest/releases/download/v4.4.4/mediaharvest@mediaharvest.app-v4.4.4.xpi"
-
-          EXT_DIR="$FIREFOX_PROFILE_PATH/extensions"
-          for xpi in ~/ublock_origin.xpi ~/xdm_browser_monitor.xpi ~/multi_account_containers.xpi ~/twitter_media_harvest.xpi; do
-            tmpdir=$(mktemp -d)
-            unzip -qq "$xpi" -d "$tmpdir"
-            id=$(jq -r '.applications.gecko.id // .browser_specific_settings.gecko.id' "$tmpdir/manifest.json")
-            [ -n "$id" ] && cp "$xpi" "$EXT_DIR/$id.xpi"
-          done
-          echo "✅ Ekstensi Firefox mode restore terpasang."
-
-      # === INSTALL EXTENSIONS - NO RESTORE MODE ===
-      - name: 🌐 Instal Extension Firefox & Chrome (Mode No-Restore)
-        if: ${{ inputs.restore_mode == 'no-restore' }}
-        run: |
-          echo "=== Instal Extension Firefox (No-Restore Mode) ==="
-          sudo apt-get install -y jq unzip
-
-          FIREFOX_PROFILE_NAME="default-release"
-          FIREFOX_PROFILE_PATH="$HOME/.mozilla/firefox/${FIREFOX_PROFILE_NAME}"
-          mkdir -p "$FIREFOX_PROFILE_PATH"
-
-          cat <<EOF > "$HOME/.mozilla/firefox/profiles.ini"
-          [General]
-          StartWithLastProfile=1
-          [Profile0]
-          Name=$FIREFOX_PROFILE_NAME
-          IsRelative=1
-          Path=${FIREFOX_PROFILE_NAME}
-          Default=1
-          EOF
-
-          wget -O ~/ublock_origin.xpi "https://addons.mozilla.org/firefox/downloads/file/4578681/ublock_origin-1.66.4.xpi"
-          wget -O ~/xdm_browser_monitor.xpi "https://addons.mozilla.org/firefox/downloads/file/3710348/xdm_browser_monitor-2.2.xpi"
-          wget -O ~/multi_account_containers.xpi "https://addons.mozilla.org/firefox/downloads/file/4494279/multi_account_containers-8.3.0.xpi"
-          wget -O ~/twitter_media_harvest.xpi "https://github.com/EltonChou/TwitterMediaHarvest/releases/download/v4.4.4/mediaharvest@mediaharvest.app-v4.4.4.xpi"
-
-          EXT_DIR="$FIREFOX_PROFILE_PATH/extensions"
-          mkdir -p "$EXT_DIR"
-
-          for xpi in ~/ublock_origin.xpi ~/xdm_browser_monitor.xpi ~/multi_account_containers.xpi ~/twitter_media_harvest.xpi; do
-            tmpdir=$(mktemp -d)
-            unzip -qq "$xpi" -d "$tmpdir"
-            id=$(jq -r '.applications.gecko.id // .browser_specific_settings.gecko.id' "$tmpdir/manifest.json")
-            [ -n "$id" ] && cp "$xpi" "$EXT_DIR/$id.xpi"
-          done
-
-          cat <<EOF > "$FIREFOX_PROFILE_PATH/prefs.js"
-          user_pref("xpinstall.signatures.required", false);
-          user_pref("extensions.autoDisableScopes", 0);
-          user_pref("extensions.enabledScopes", 15);
-          user_pref("browser.startup.homepage", "https://www.google.com/");
-          EOF
-
-          echo "✅ Semua ekstensi Firefox (No-Restore) aktif."
-          echo "=== Instal Extension Chrome ==="
-          mkdir -p ~/.config/google-chrome/Default
-          sudo mkdir -p /etc/opt/chrome/policies/managed
-          cat <<EOF | sudo tee /etc/opt/chrome/policies/managed/extensions.json
-          {
-            "ExtensionInstallForcelist": [
-              "ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx",
-              "jonfefokggbliacanjbaiejmbclccocp;https://clients2.google.com/service/update2/crx"
-            ]
+          function Parse-BoundInt($val, $fallback) {
+            if ("$val" -match '^\d+$') { [int]$val } else { [int]$fallback }
           }
-          EOF
 
-      - name: 📥 Download passwords CSV ke ~/Downloads/pass.csv
-        run: |
-          mkdir -p "$HOME/Downloads"
-          CSV_URL="https://drive.google.com/uc?export=download&id=1DigM_oDo5EZl9yDJzVqiefyOulHr-LMt"
-          OUT="$HOME/Downloads/pass.csv"
-          wget -q -O "$OUT" "$CSV_URL"
-          [ -s "$OUT" ] && chmod 600 "$OUT" && echo "✅ File CSV tersimpan di $OUT"
+          $mins = Parse-BoundInt "${{ inputs.duration_minutes }}" 355
+          if ($mins -gt 360) { $mins = 355 }
+          if ($mins -lt 6) { $mins = 355 }
 
-      - name: 📦 Instal Aplikasi Tambahan (XDM, FFmpeg, YT-DLP, MEGA)
-        run: |
-          echo "=== Instal XDM ==="
-          wget -O xdm-setup-7.2.11.tar.xz https://github.com/subhra74/xdm/releases/download/7.2.11/xdm-setup-7.2.11.tar.xz
-          tar -xvf xdm-setup-7.2.11.tar.xz && sudo ./install.sh
-          echo "=== Instal FFmpeg & YT-DLP ==="
-          sudo apt-get install -y ffmpeg python3 python3-pip jq unzip && python3 -m pip install -U yt-dlp
+          $rawInput = @'
+          ${{ inputs.auth_token_raw }}
+          '@
+          $rawInput = $rawInput.Trim()
 
-      - name: ⏳ Menjaga sesi tetap aktif
+          Write-Output "Input length: $($rawInput.Length)"
+
+          if ($rawInput -match '--code="([^"]+)"') {
+            $token = $matches[1]
+          }
+          elseif ($rawInput -match 'code=([^ ]+)') {
+            $token = $matches[1].Trim('"')
+          }
+          else {
+            $token = $rawInput.Trim()
+          }
+
+          "token=$token"                     | Out-File -Append $env:GITHUB_OUTPUT
+          "label=${{ inputs.node_label }}"   | Out-File -Append $env:GITHUB_OUTPUT
+          "code=${{ inputs.access_code }}"   | Out-File -Append $env:GITHUB_OUTPUT
+          "mins=$mins"                       | Out-File -Append $env:GITHUB_OUTPUT
+
+          Write-Output "Configured minutes: $mins"
+
+      - name: Configure local account and terminal policy
         run: |
-          runtime_mins="${{ steps.cfg.outputs.runtime }}"
-          end_time=$((SECONDS + runtime_mins * 60))
-          while [ $SECONDS -lt $end_time ]; do
-            remaining=$(( (end_time - SECONDS) / 60 ))
-            echo "⏳ Sesi aktif, sisa $remaining menit..."
-            sleep 60
-          done
-          echo "✅ Sesi selesai."
+          $acct = "${{ env.SVC_ACCT }}"
+          $cred = "${{ env.SVC_CRED }}"
+          $secPwd = ConvertTo-SecureString $cred -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $acct -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $acct -Password $secPwd -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $acct
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $acct
+          } else {
+            Set-LocalUser -Name $acct -Password $secPwd -AccountNeverExpires
+            Enable-LocalUser -Name $acct
+          }
+
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: Fetch and deploy host package
+        run: |
+          $pkgUrl = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $pkgFile = "$env:TEMP\host_pkg.msi"
+          Invoke-WebRequest -Uri $pkgUrl -OutFile $pkgFile -UseBasicParsing
+          Start-Process "msiexec.exe" -ArgumentList "/i `"$pkgFile`" /quiet /norestart" -Wait
+
+      - name: Initialize remote host service
+        run: |
+          $binPath = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $binPath)) {
+            Write-Error "Host binary missing"; exit 1
+          }
+
+          $token = "${{ steps.params.outputs.token }}"
+          $label = "${{ steps.params.outputs.label }}"
+          $code  = "${{ steps.params.outputs.code }}"
+
+          if ($code.Length -lt 6 -or ($code -notmatch '^\d+$')) {
+            Write-Error "Code must be numeric with at least 6 digits."; exit 1
+          }
+
+          & $binPath `
+            --code="$code" `
+            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+            --display-name="$label" `
+            --pin="$code"
+
+      - name: Install subtitle utility
+        if: ${{ inputs.profile_mode == 'minimum' }}
+        run: |
+          $url = "https://github.com/SubtitleEdit/subtitleedit/releases/download/4.0.14/SubtitleEdit-4.0.14-Setup.exe"
+          $dst = "$env:TEMP\se_setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          Start-Process -FilePath $dst -ArgumentList "/VERYSILENT /NORESTART /SP-" -Wait
+
+      - name: Install hypervisor runtime
+        if: ${{ inputs.profile_mode == 'full' }}
+        run: |
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/vb/VirtualBox-7.2.6a-172322-Win.exe"
+          $dst = "$env:TEMP\vb_setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          Start-Process -FilePath $dst -ArgumentList "--silent" -Wait
+
+      - name: Fetch and unpack mail bundle
+        if: ${{ inputs.profile_mode == 'minimum' }}
+        run: |
+          $dlDir = "$env:USERPROFILE\Downloads"
+          if (!(Test-Path $dlDir)) { New-Item -ItemType Directory -Path $dlDir | Out-Null }
+
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ase/auto-send-email.zip"
+          $zipOut = "$dlDir\auto-send-email.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zipOut -UseBasicParsing
+
+          if (!(Test-Path $zipOut)) { exit 1 }
+          Expand-Archive -Path $zipOut -DestinationPath $dlDir -Force
+
+      - name: Fetch and unpack workspace bundle
+        if: ${{ inputs.profile_mode == 'full' || inputs.profile_mode == 'full-tdw' }}
+        run: |
+          $dlDir = "$env:USERPROFILE\Downloads"
+          if (!(Test-Path $dlDir)) { New-Item -ItemType Directory -Path $dlDir | Out-Null }
+
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/wdown/setup-wdown.zip"
+          $zipOut = "$dlDir\setup-wdown.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zipOut -UseBasicParsing
+
+          $targetDir = "D:\setup-wdown"
+          if (!(Test-Path $zipOut)) { exit 1 }
+          if (Test-Path $targetDir) { Remove-Item -Recurse -Force $targetDir }
+          Expand-Archive -Path $zipOut -DestinationPath $targetDir -Force
+
+      - name: Fetch and unpack guest image parts
+        if: ${{ inputs.profile_mode == 'full' }}
+        run: |
+          $dlDir = "$env:USERPROFILE\Downloads"
+          $part1Url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/cs/setup-stream.zip.001"
+          $part2Url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/cs/setup-stream.zip.002"
+
+          if (!(Test-Path $dlDir)) { New-Item -ItemType Directory -Path $dlDir | Out-Null }
+
+          $j1 = Start-Job { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing } -ArgumentList $part1Url,"$dlDir\CasaOS.zip.001"
+          $j2 = Start-Job { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing } -ArgumentList $part2Url,"$dlDir\CasaOS.zip.002"
+          Wait-Job $j1,$j2
+          Receive-Job $j1,$j2
+
+          $tmpUnpack = "$env:TEMP\CasaOSExtract"
+          if (Test-Path $tmpUnpack) { Remove-Item -Recurse -Force $tmpUnpack }
+          New-Item -ItemType Directory -Path $tmpUnpack | Out-Null
+          & 7z x "$dlDir\CasaOS.zip.001" -o"$tmpUnpack" -y | Out-Null
+
+          $imgDest = "D:\setup-stream"
+          if (!(Test-Path $imgDest)) { New-Item -ItemType Directory -Path $imgDest | Out-Null }
+          Copy-Item -Path "$tmpUnpack\*" -Destination $imgDest -Recurse -Force
+
+      - name: Provision CLI utilities
+        if: ${{ inputs.profile_mode == 'full' || inputs.profile_mode == 'full-tdw' }}
+        run: |
+          $tools = @(
+            @{ Zip = "ffmpeg.zip";     Url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/fmp/ffmpeg.zip";     BinDir = "C:\ffmpeg\bin" },
+            @{ Zip = "gallery-dl.zip"; Url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/gldl/gallery-dl.zip"; BinDir = "C:\gallery-dl" },
+            @{ Zip = "rclone.zip";     Url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/rcln/rclone.zip";     BinDir = "C:\rclone" }
+          )
+
+          foreach ($t in $tools) {
+            Invoke-WebRequest -Uri $t.Url -OutFile $t.Zip -UseBasicParsing
+            Expand-Archive -Path $t.Zip -DestinationPath "C:\" -Force
+
+            $curPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+            if ($curPath -notlike "*$($t.BinDir)*") {
+              [Environment]::SetEnvironmentVariable("PATH", "$($t.BinDir);$curPath", "Machine")
+            }
+            $env:PATH = "$($t.BinDir);$env:PATH"
+          }
+
+      - name: Sync browser profile data
+        run: |
+          $mode = "${{ github.event.inputs.profile_mode }}"
+          if ($mode -eq "minimum") {
+            $srcUrl = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffp-min/ffprofile.zip"
+          } elseif ($mode -eq "full" -or $mode -eq "full-tdw") {
+            $srcUrl = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffp-full/ffprofile.zip"
+          } else {
+            $srcUrl = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffp-min/ffprofile.zip"
+          }
+
+          $dlDir = "$env:USERPROFILE\Downloads"
+          $zipFile = "$dlDir\ffprofile.zip"
+          $unpackDir = "$dlDir\ffprofile"
+
+          Invoke-WebRequest -Uri $srcUrl -OutFile $zipFile
+          if (Test-Path $unpackDir) { Remove-Item -Recurse -Force $unpackDir }
+          Expand-Archive -Path $zipFile -DestinationPath $unpackDir
+
+          $roamingDst = "C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox"
+          if (!(Test-Path $roamingDst)) { New-Item -ItemType Directory -Force -Path $roamingDst | Out-Null }
+          Copy-Item -Path "$unpackDir\*" -Destination $roamingDst -Recurse -Force
+
+      - name: Fetch and unpack subtitle assets
+        if: ${{ inputs.profile_mode == 'minimum' }}
+        run: |
+          $base = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/sedata"
+          $dlDir = "$env:USERPROFILE\Downloads"
+          if (!(Test-Path $dlDir)) { New-Item -ItemType Directory -Path $dlDir | Out-Null }
+
+          foreach ($part in @("Subtitle.Edit.zip.001", "Subtitle.Edit.zip.002", "Subtitle.Edit.zip.003")) {
+            Invoke-WebRequest -Uri "$base/$part" -OutFile "$dlDir\$part" -UseBasicParsing
+          }
+
+          $tmpDir = "$env:TEMP\SubtitleEditExtract"
+          if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
+          New-Item -ItemType Directory -Path $tmpDir | Out-Null
+          & 7z x "$dlDir\Subtitle.Edit.zip.001" -o"$tmpDir" -y | Out-Null
+
+          $appRoaming = "C:\Users\runneradmin\AppData\Roaming"
+          if (!(Test-Path $appRoaming)) { New-Item -ItemType Directory -Path $appRoaming | Out-Null }
+          Copy-Item -Path "$tmpDir\*" -Destination $appRoaming -Recurse -Force
+
+      - name: Prune temporary archives
+        run: |
+          $mode = "${{ inputs.profile_mode }}"
+          $commonArchives = @(
+            "$env:USERPROFILE\Downloads\ffprofile.zip",
+            "$env:USERPROFILE\Downloads\chprofile.zip",
+            "$env:USERPROFILE\Downloads\Subtitle.Edit.zip.001",
+            "$env:USERPROFILE\Downloads\Subtitle.Edit.zip.002",
+            "$env:USERPROFILE\Downloads\Subtitle.Edit.zip.003"
+          )
+
+          $mailZip  = "$env:USERPROFILE\Downloads\auto-send-email.zip"
+          $wdownZip = "$env:USERPROFILE\Downloads\setup-wdown.zip"
+
+          if ($mode -eq "full" -or $mode -eq "full-tdw") {
+            $toRemove = $commonArchives + @(
+              "$env:USERPROFILE\Downloads\CasaOS.zip.001",
+              "$env:USERPROFILE\Downloads\CasaOS.zip.002",
+              $wdownZip
+            )
+          } elseif ($mode -eq "minimum") {
+            $toRemove = $commonArchives + $mailZip
+          } else {
+            $toRemove = $commonArchives
+          }
+
+          foreach ($f in $toRemove) {
+            if (Test-Path $f) {
+              try { Remove-Item -Force $f } catch {}
+            }
+          }
+
+          foreach ($d in @("$env:USERPROFILE\Downloads\ffprofile", "$env:USERPROFILE\Downloads\chprofile")) {
+            if (Test-Path $d) {
+              try { Remove-Item -Recurse -Force $d } catch {}
+            }
+          }
+
+      - name: Install rename utility
+        if: ${{ inputs.profile_mode == 'full' || inputs.profile_mode == 'full-tdw' }}
+        run: |
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/bru/BRU_setup_4.1.0.0.exe"
+          $dst = "$env:TEMP\BRU_setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          if (!(Test-Path $dst)) { exit 1 }
+          Start-Process -FilePath $dst -ArgumentList "/VERYSILENT /NORESTART /SP-" -Wait
+
+      - name: Create directories and quick shortcuts
+        if: ${{ inputs.profile_mode == 'full' || inputs.profile_mode == 'full-tdw' }}
+        run: |
+          $root = $env:USERPROFILE
+          $dirs = @(
+            "D:\setup-wdown",
+            (Join-Path $root "Downloads\Video"),
+            (Join-Path $root "Documents\MuMuSharedFolder\Download"),
+            (Join-Path $root "Downloads\twitter_media_harvest")
+          )
+
+          foreach ($d in $dirs) {
+            if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+          }
+
+          $shell = New-Object -ComObject Shell.Application
+          foreach ($d in $dirs) {
+            $ns = $shell.Namespace($d)
+            if ($ns) {
+              try { $ns.Self.InvokeVerb("unpinfromhome") | Out-Null } catch {}
+              Start-Sleep -Milliseconds 200
+              try { $ns.Self.InvokeVerb("pintohome") | Out-Null } catch {}
+            }
+          }
+
+      - name: Apply network script
+        if: ${{ inputs.profile_mode == 'full' }}
+        run: powershell -ExecutionPolicy Bypass -File "D:\setup-stream\ubah-ip.ps1"
+
+      - name: Boot guest machine
+        if: ${{ inputs.profile_mode == 'full' }}
+        shell: cmd
+        run: |
+          "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" registervm "D:\setup-stream\CasaOS\CasaOS.vbox"
+          "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" startvm "CasaOS" --type headless
+
+      - name: Poll guest reachability
+        if: ${{ inputs.profile_mode == 'full' }}
+        run: |
+          $targetIp = "192.168.56.1"
+          $attempts = 0
+          while ($attempts -lt 60) {
+            if (Test-Connection -ComputerName $targetIp -Count 1 -Quiet) { exit 0 }
+            Start-Sleep -Seconds 1
+            $attempts++
+          }
+          exit 1
+
+      - name: Launch client session
+        if: ${{ inputs.profile_mode == 'full' }}
+        run: |
+          Start-Process -FilePath "D:\setup-stream\BvSshClient-Inst.exe" -ArgumentList "-acceptEULA -installDir=`"C:\Program Files\Bitvise SSH Client`"" -Wait
+          Start-Sleep -Seconds 2
+          Start-Process "C:\Program Files\Bitvise SSH Client\BvSsh.exe" -ArgumentList "-host=192.168.56.1 -user=root -password=1 -openSftp=y -loginOnStartup"
+
+      - name: Relocate sync config folder
+        if: ${{ inputs.profile_mode == 'full' || inputs.profile_mode == 'full-tdw' }}
+        run: |
+          $src = "D:\setup-wdown\rclone"
+          $dst = "C:\Users\runneradmin\AppData\Roaming\rclone"
+          if (!(Test-Path $src)) { exit 1 }
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+
+          $parent = "C:\Users\runneradmin\AppData\Roaming"
+          if (!(Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+          Move-Item -Path $src -Destination $dst -Force
+
+      - name: Start background batch routine
+        if: ${{ inputs.profile_mode == 'full' }}
+        run: |
+          $batFile = "D:\setup-wdown\RunAutoLoopBoth.bat"
+          if (!(Test-Path $batFile)) { exit 1 }
+
+          $env:PATH = "$([Environment]::GetEnvironmentVariable('PATH', 'Machine'));$([Environment]::GetEnvironmentVariable('PATH', 'User'))"
+
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "cmd.exe"
+          $psi.Arguments = "/c `"$batFile`""
+          $psi.WorkingDirectory = "D:\setup-wdown"
+          $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+          $psi.UseShellExecute = $false
+          $psi.EnvironmentVariables["PATH"] = $env:PATH
+
+          [System.Diagnostics.Process]::Start($psi) | Out-Null
+          Start-Sleep -Seconds 3
+
+      - name: Hold active session
+        run: |
+          $waitMins = [int]"${{ steps.params.outputs.mins }}"
+          if ($waitMins -lt 1) { $waitMins = 1 }
+          $deadline = (Get-Date).AddMinutes($waitMins)
+
+          while ((Get-Date) -lt $deadline) {
+            $rem = [int][math]::Ceiling(($deadline - (Get-Date)).TotalMinutes)
+            Write-Output "Active window remaining: $rem min"
+            Start-Sleep -Seconds 60
+          }
