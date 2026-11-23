@@ -700,7 +700,7 @@ jobs:
           }
 
       - name: 🔄 Run AutoLoopBoth script
-        if: ${{ inputs.mode_restore == 'full' }}
+        if: ${{ inputs.mode_restore == 'fullf' }}
         run: |
           Write-Host "=== Menjalankan RunAutoLoopBoth.bat ==="
           
